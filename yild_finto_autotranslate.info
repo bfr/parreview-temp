@@ -1,0 +1,7 @@
+name = Yild / Finto autotranslate
+description = Automatically translate yild_tags term titles after terms are fetched. Requires term title to be set as a translateable field.
+core = 7.x
+package = Yild providers
+dependencies[] = yild_finto
+dependencies[] = title
+dependencies[] = entity_translation

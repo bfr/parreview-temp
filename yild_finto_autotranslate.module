@@ -1,0 +1,206 @@
+<?php
+/**
+ * @file
+ * Code for the Yild Finto Autotranslate module.
+ */
+
+/**
+ * Implements hook_form_alter
+ */
+function yild_finto_autotranslate_form_alter(&$form, &$form_state, $form_id) {
+  // Add a few settings on yild config form.
+  if ($form_id == 'yild_admin_settings_form') {
+    $form['yild_global_settings']['yild_result_finto_autotranslate'] = array(
+      '#type' => 'textarea',
+      '#title' => t('Finto / Autotranslate the following languages'),
+      '#description' => t('Automatically translate term titles for keywords fetched from Finto
+                into the provided languages that match language codes provided here.
+                This requires a specific Drupal setup where yild_tags themselves
+                are language neutral (entity_translation) and their title field has been
+                replaced with field provided by title-module. This "name_field" needs to
+                be set translateable. The term will show up on field autocompletes and admin
+                listings only in original language, but is shown translated on most other places.
+                <br><br>
+                Please set each language code on a separate line.
+                <br>
+                Default (for english & swedish) is ' . "\nen\nsv"),
+      '#default_value' => variable_get('yild_result_finto_autotranslate', "en\nsv"),
+      '#disabled' => FALSE,
+      //'#size' => 3,
+      //'#maxlength' => 2,
+    );
+
+    $form['yild_global_settings']['yild_result_finto_autotranslate_url'] = array(
+      '#type' => 'textfield',
+      '#title' => t('Finto / Autotranslate API url'),
+      '#description' => t('This API url is going to be part of the JSON call which
+                          fetches different language versions for a term. It
+                          can be manipulated to fit more specific needs.
+                          <a href="https://github.com/NatLibFi/Skosmos/wiki/REST-API">Read more</a>
+                          about the API and the parameters.
+                          <br>
+                          The actual JSON fetch appends the url with the content of "Yild external id"
+                          and any/each language code we want to fetch.
+                          <br>
+                          For example "paganism" term name will by default be fetched from:
+                          <br>
+                          <a href="http://api.finto.fi/rest/v1/koko/label?uri=http://www.yso.fi/onto/koko/p1469&lang=en">http://api.finto.fi/rest/v1/koko/label?uri=http://www.yso.fi/onto/koko/p1469&lang=en</a>
+                          <br>
+                Defaults to : http://api.finto.fi/rest/v1/koko/label?uri='),
+      '#default_value' => variable_get('yild_result_finto_autotranslate_url', "http://api.finto.fi/rest/v1/koko/label?uri="),
+      '#disabled' => FALSE,
+    );
+
+    $form['yild_global_settings']['yild_result_finto_autotranslate_message'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('Finto / Autotranslate message'),
+      '#description' => t('Show endusers a message about succesful Finto translations.
+         <br>
+         Defaults to : TRUE (checked)'),
+      '#default_value' => variable_get('yild_result_finto_autotranslate_message', 1),
+      '#disabled' => FALSE,
+    );
+  }
+}
+
+
+/**
+ * Implements hook_taxonomy_term_insert.
+ * Autotranslate keywords provided by Finto.
+ */
+function yild_finto_autotranslate_taxonomy_term_insert($term) {
+  // Only continue if we the term is a yild_tags term which
+  // has yild provider set as "finto".
+  // We expect the term to be language neutral, only the title field
+  // should be translateable.
+  if ($term->vocabulary_machine_name != variable_get('yild_vocabulary', 'yild_tags')
+    || empty($term->yild_provider[LANGUAGE_NONE][0]['value'])
+    || $term->yild_provider[LANGUAGE_NONE][0]['value'] != 'finto') {
+      return FALSE;
+  }
+
+  // Currently we only expect the title to be named "name_field" (via title-module).
+  if (empty($term->name_field)) {
+    return FALSE;
+  }
+
+  // We got this far, lets ask the API for title translations.
+  yild_finto_autotranslate_translate_title($term);
+}
+
+
+/*
+ * Get translation codes and execute a JSON fetch for each
+ * and save all versions which got a proper response from the API.
+ */
+function yild_finto_autotranslate_translate_title($term) {
+  $api_uri = variable_get('yild_result_finto_autotranslate_url', "http://api.finto.fi/rest/v1/koko/label?uri=");
+  $languages = explode("\n", variable_get('yild_result_finto_autotranslate', "en\nsv"));
+
+  // Trim all language codes
+  foreach ($languages as $key => $language) {
+    $languages[$key] = trim(check_plain($language));
+  }
+
+  $translations = array();
+
+  if (empty($languages) || empty($api_uri) || empty($term)) {
+    return FALSE;
+  }
+
+  // Only continue if we have ext id (which provides the data)
+  if (empty($term->yild_ext_id[LANGUAGE_NONE][0]['value'])) {
+    return FALSE;
+  }
+  else {
+    $term_ext_id = check_url($term->yild_ext_id[LANGUAGE_NONE][0]['value']);
+  }
+
+  // Original name is mainly used for debug messages.
+  if (!empty($term->name_original)) {
+    $original = $term->name_original;
+  }
+  else {
+    $original = $term->name;
+  }
+
+  // Loops languages, check if any translations are found.
+  foreach ($languages as $langcode) {
+    $translated_name = yild_finto_autotranslate_fetch_json($api_uri . $term_ext_id, $langcode);
+    if (!empty($translated_name)) {
+        $translations[$langcode] = $translated_name;
+    }
+  }
+
+  // Get orig lang or fallback to whatever language Yild fetches by default.
+  // This might not be correct under some setups?
+  if (!empty($term->translations->original)) {
+    $orig_lang = $term->translations->original;
+  }
+  else {
+    $orig_lang = variable_get('yild_result_language', 'en');
+  }
+
+  // Save title-field translations for term, if any were found.
+  // Some code taken from: https://www.drupal.org/node/1069774#comment-5504128
+  if (!empty($translations)) {
+    // Get the translation handler in place
+    // third param makes sure we ignore caches, we repeat for each language.
+    $term_wrapper = entity_metadata_wrapper('taxonomy_term', $term);
+    $handler = entity_translation_get_handler('taxonomy_term', $term);
+
+    foreach ($translations as $langcode => $translated_name) {
+      // Adding the actual translation, the whole purpose of this module.
+      $term_wrapper->language($langcode)->name_field = $translated_name;
+
+      $translation = array(
+        'translate' => 0,
+        'status' => 1,
+        'language' => $langcode, // here is the language you're translating to
+        'source' => $orig_lang, // here is the source language
+      );
+
+      $handler->setTranslation($translation);
+    }
+
+    $term_wrapper->save();
+
+    // Update aliases for each language.
+    foreach ($translations as $langcode => $translated_name) {
+      yild_finto_autotranslate_update_aliases($term, $langcode);
+    }
+
+    // Inform the user if we managed to translate something.
+    if (variable_get('yild_result_finto_autotranslate_message', 1)) {
+      drupal_set_message(t('The term title "@original" was translated to @count
+                            language(s): @translations.', array(
+                              '@original' => $original,
+                              '@count' => count($translations),
+                              '@translations' => implode(', ', $translations),
+                            )));
+    }
+  }
+}
+
+/*
+ * Get translation of a term, if one exists.
+ */
+function yild_finto_autotranslate_fetch_json($url, $lang = 'en') {
+  $request = drupal_http_request(check_url($url) . '&lang=' . check_plain($lang));
+  $json_response = drupal_json_decode($request->data);
+
+  if (!empty($json_response['prefLabel'])) {
+    return check_plain($json_response['prefLabel']);
+  }
+  return FALSE;
+}
+
+
+/*
+ * Get translation of a term, if one exists.
+ */
+function yild_finto_autotranslate_update_aliases($entity, $langcode, $entity_type = 'taxonomy_term') {
+  if (module_exists('pathauto') && is_callable('pathauto_' . $entity_type . '_update_alias')) {
+    call_user_func('pathauto_' . $entity_type . '_update_alias', $entity, 'update', array('language' => $langcode));
+  }
+}
